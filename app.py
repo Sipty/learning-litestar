@@ -1,53 +1,100 @@
-from dataclasses import dataclass
+from collections.abc import AsyncGenerator, Sequence
+from contextlib import asynccontextmanager
+from typing import Any
 
 from litestar import Litestar, get, post, put
-from litestar.exceptions import HTTPException
+from litestar.datastructures import State
+from litestar.exceptions import ClientException, NotFoundException
+from litestar.status_codes import HTTP_409_CONFLICT
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError, NoResultFound
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+TodoType = dict[str, Any]
+TodoCollectionType = list[TodoType]
 
 
-@dataclass
-class Todo:
-    title: str
-    done: bool
+class Base(DeclarativeBase): ...
 
 
-# TODO: move to databasee
-TODO_LIST: list[Todo] = [
-    Todo(title="Start writing TODO list", done=True),
-    Todo(title="???", done=False),
-    Todo(title="Profit", done=False),
-]
+class TodoItem(Base):
+    __tablename__ = "todo_items"
+
+    title: Mapped[str] = mapped_column(primary_key=True)
+    done: Mapped[bool]
+
+
+@asynccontextmanager
+async def db_connection(app: Litestar) -> AsyncGenerator[None, None]:
+    engine = getattr(app.state, "engine", None)
+    if engine is None:
+        engine = create_async_engine("sqlite+aiosqlite:///todo.sqlite", echo=True)
+        app.state.engine = engine
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    try:
+        yield
+    finally:
+        await engine.dispose()
+
+
+sessionmaker = async_sessionmaker(expire_on_commit=False)
+
+
+def serialize_todo(todo: TodoItem) -> TodoType:
+    return {"title": todo.title, "done": todo.done}
+
+
+async def get_todo_by_title(todo_name: str, session: AsyncSession) -> TodoItem:
+    query = select(TodoItem).where(TodoItem.title == todo_name)
+    result = await session.execute(query)
+    try:
+        return result.scalar_one()
+    except NoResultFound as e:
+        raise NotFoundException(detail=f"TODO {todo_name!r} not found") from e
+
+
+async def get_todo_list(done: bool | None, session: AsyncSession) -> Sequence[TodoItem]:
+    query = select(TodoItem)
+    if done is not None:
+        query = query.where(TodoItem.done.is_(done))
+
+    result = await session.execute(query)
+    return result.scalars().all()
 
 
 @get("/")
-async def get_list(done: bool | None = None) -> list[Todo]:
-    if done is None:
-        return TODO_LIST
-    return [todo for todo in TODO_LIST if todo.done == done]
+async def get_list(state: State, done: bool | None = None) -> TodoCollectionType:
+    async with sessionmaker(bind=state.engine) as session:
+        return [serialize_todo(todo) for todo in await get_todo_list(done, session)]
 
 
 @post("/")
-async def add_todo(data: Todo) -> list[Todo]:
-    TODO_LIST.append(data)
-    return TODO_LIST
+async def add_item(data: TodoType, state: State) -> TodoType:
+    new_todo = TodoItem(title=data["title"], done=data["done"])
+    async with sessionmaker(bind=state.engine) as session:
+        try:
+            async with session.begin():
+                session.add(new_todo)
+        except IntegrityError as e:
+            raise ClientException(
+                status_code=HTTP_409_CONFLICT,
+                detail=f"TODO {new_todo.title!r} already exists",
+            ) from e
+
+    return serialize_todo(new_todo)
 
 
-@get("/{name:str}")
-async def greeter(name: str) -> str:
-    return f"Hello, {name}!"
+@put("/{item_title:str}")
+async def update_item(item_title: str, data: TodoType, state: State) -> TodoType:
+    async with sessionmaker(bind=state.engine) as session, session.begin():
+        todo_item = await get_todo_by_title(item_title, session)
+        todo_item.title = data["title"]
+        todo_item.done = data["done"]
+    return serialize_todo(todo_item)
 
 
-@put("/{title:str}")
-async def update_todo(title: str, data: Todo) -> list[Todo]:
-    for todo in TODO_LIST:
-        if todo.title == title:
-            todo.title = data.title
-            todo.done = data.done
-            return TODO_LIST
-
-    if title == "trycatch":
-        return "CATCH!"
-
-    raise HTTPException(status_code=404, detail=f"Todo '{title}' not found")
-
-
-app = Litestar([get_list, add_todo, greeter, update_todo])
+app = Litestar([get_list, add_item, update_item], lifespan=[db_connection])

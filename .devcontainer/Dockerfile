@@ -6,7 +6,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # Configure apt and install packages
 RUN apt-get update \
     && apt-get -y install --no-install-recommends apt-utils dialog 2>&1 \
-    && apt-get -y install git procps lsb-release \
+    && apt-get -y install git procps lsb-release openssh-client \
     && apt-get autoremove -y \
     && apt-get clean -y \
     && rm -rf /var/lib/apt/lists/*
@@ -30,6 +30,10 @@ RUN groupadd --gid $USER_GID $USERNAME \
 COPY requirements.txt /tmp/pip-tmp/
 RUN pip3 --disable-pip-version-check --no-cache-dir install -r /tmp/pip-tmp/requirements.txt \
     && rm -rf /tmp/pip-tmp
+
+# Set bash as default shell
+RUN chsh -s /bin/bash $USERNAME
+ENV SHELL=/bin/bash
 
 # Set the default user
 USER $USERNAME 
